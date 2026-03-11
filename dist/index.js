@@ -90227,6 +90227,27 @@ const runnersCache = {
   totalCount: 0,
 };
 
+const apiStats = {
+  totalCalls: 0,
+  cacheHits: 0,
+  registrationTokenCalls: 0,
+  listRunnersCalls: 0,
+  deleteRunnerCalls: 0,
+};
+
+function logApiStats() {
+  core.info('=====================================');
+  core.info('  GitHub API Call Summary');
+  core.info('=====================================');
+  core.info(`  Total API calls:        ${apiStats.totalCalls}`);
+  core.info(`  Cache hits (no cost):   ${apiStats.cacheHits}`);
+  core.info(`  Registration token:     ${apiStats.registrationTokenCalls}`);
+  core.info(`  List runners:           ${apiStats.listRunnersCalls}`);
+  core.info(`  Delete runner:          ${apiStats.deleteRunnerCalls}`);
+  core.info(`  Effective API calls:    ${apiStats.totalCalls - apiStats.cacheHits}`);
+  core.info('=====================================');
+}
+
 function sleep(seconds) {
   return new Promise((resolve) => setTimeout(resolve, seconds * 1000));
 }
@@ -90278,9 +90299,11 @@ async function fetchAllRunners(octokit) {
     }
 
     const response = await octokit.request('GET /repos/{owner}/{repo}/actions/runners', requestOptions);
+    apiStats.totalCalls++;
+    apiStats.listRunnersCalls++;
 
     if (response.status === 304) {
-      core.info('Runners data unchanged (ETag match) - using cached data, no rate limit consumed');
+      apiStats.cacheHits++;
       return { runners: runnersCache.runners, totalCount: runnersCache.totalCount, fromCache: true };
     }
 
@@ -90351,6 +90374,8 @@ async function getRegistrationToken() {
 
   try {
     const response = await octokit.request('POST /repos/{owner}/{repo}/actions/runners/registration-token', config.githubContext);
+    apiStats.totalCalls++;
+    apiStats.registrationTokenCalls++;
     core.info('GitHub Registration Token is received');
     return response.data.token;
   } catch (error) {
@@ -90375,6 +90400,8 @@ async function removeRunner() {
   for (const runner of runners) {
     try {
       await octokit.request('DELETE /repos/{owner}/{repo}/actions/runners/{runner_id}', _.merge(config.githubContext, { runner_id: runner.id }));
+      apiStats.totalCalls++;
+      apiStats.deleteRunnerCalls++;
       core.info(`GitHub self-hosted runner ${runner.name} is removed`);
     } catch (error) {
       core.error(`GitHub self-hosted runner removal error: ${error}`);
@@ -90385,6 +90412,8 @@ async function removeRunner() {
   if (errors.length > 0) {
     core.setFailed('Failures occurred when removing runners.');
   }
+
+  logApiStats();
 }
 
 function getOfflineLabels(labels, runners) {
@@ -90424,6 +90453,7 @@ async function waitForLabelsRegistered(labels, timeoutMinutes, initialRetryInter
 
     if (offlineLabels.length === 0) {
       core.info(`GitHub self-hosted runners for labels ${JSON.stringify(expectedLabels)} are registered and ready to use`);
+      logApiStats();
       return;
     }
 
@@ -90433,6 +90463,7 @@ async function waitForLabelsRegistered(labels, timeoutMinutes, initialRetryInter
     retryIntervalSeconds = Math.min(Math.floor(retryIntervalSeconds * 1.5), maxRetryIntervalSeconds);
   }
 
+  logApiStats();
   throw new Error(
     `A timeout of ${timeoutMinutes} minutes is exceeded. Your AWS EC2 instances with labels ${JSON.stringify(expectedLabels)} were not able to register as new GitHub self-hosted runners.`
   );
