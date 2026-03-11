@@ -226,8 +226,8 @@ async function waitForRunnerRegistered(label, timeoutMinutes, retryIntervalSecon
 
 async function waitForRunnersRegistered(labels) {
   const timeoutMinutes = 7;
-  const initialRetryIntervalSeconds = 45;
-  const quietPeriodSeconds = 60;
+  const initialRetryIntervalSeconds = 30;
+  const quietPeriodSeconds = 120; // Wait 2 min for EC2 to boot before first poll
 
   return waitForLabelsRegistered(labels, timeoutMinutes, initialRetryIntervalSeconds, quietPeriodSeconds);
 }
