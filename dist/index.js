@@ -88919,47 +88919,96 @@ const github = __nccwpck_require__(22726);
 const _ = __nccwpck_require__(67482);
 const config = __nccwpck_require__(14986);
 
-// use the unique label to find the runner
-// as we don't have the runner's id, it's not possible to get it in any other way
-async function getRunners(label,isDeleteFlow) {
-  const octokit = github.getOctokit(config.input.githubToken);
+function sleep(seconds) {
+  return new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+}
 
+function normalizeLabels(input, isDeleteFlow) {
+  if (Array.isArray(input)) {
+    return input.filter(Boolean);
+  }
+  if (typeof input !== 'string' || input.length === 0) {
+    return [];
+  }
+  if (!isDeleteFlow) {
+    return [input];
+  }
   try {
-    const runners = await octokit.paginate('GET /repos/{owner}/{repo}/actions/runners', config.githubContext);
-
-      if(!isDeleteFlow) {
-        core.info(`got the labels ${JSON.stringify(label)}`);
-        core.info(`Runners is ${JSON.stringify(runners)}`);
-        if (runners.length === undefined) {
-          core.info(`Runners is ${JSON.stringify(runners)}`)
-        } else {
-          const runnersLength = runners.length;
-          core.info(`Total Runners and Runners Length ${runnersLength}`);
-        }
-        const foundRunners = runners.filter(runner => runner.labels.some(labelObj => labelObj.name === label));
-        core.info(`Found runners ${JSON.stringify(foundRunners)}`);
-        return foundRunners.length > 0 ? foundRunners : null;
-
-      }else{
-        core.info(`got the labels ${JSON.stringify(label)}`);
-        core.info(`Runners is ${JSON.stringify(runners)}`);
-        if (runners.length === undefined) {
-          core.info(`Runners is ${JSON.stringify(runners)}`)
-        } else {
-          const runnersLength = runners.length;
-          core.info(`Total Runners and Runners Length ${runnersLength}`);
-        }
-        const labels= JSON.parse(label);
-        const foundRunners = runners.filter(runner => runner.labels.some(labelObj => labels.includes(labelObj.name)));
-        core.info(`Found runners ${JSON.stringify(foundRunners)}`);
-        return foundRunners.length > 0 ? foundRunners : null;
-
-      }
+    const parsed = JSON.parse(input);
+    return Array.isArray(parsed) ? parsed.filter(Boolean) : [input];
   } catch (error) {
-    core.error('GitHub self-hosted runner receiving error',error);
+    return [input];
+  }
+}
+
+function getRateLimitHint(error) {
+  const remaining = error?.response?.headers?.['x-ratelimit-remaining'];
+  if (remaining !== '0') {
     return null;
   }
 
+  const reset = error?.response?.headers?.['x-ratelimit-reset'];
+  if (!reset) {
+    return 'GitHub API rate limit exceeded.';
+  }
+
+  const resetAt = new Date(Number(reset) * 1000).toISOString();
+  return `GitHub API rate limit exceeded. Resets at ${resetAt}.`;
+}
+
+// use the unique label to find the runner
+// as we don't have the runner's id, it's not possible to get it in any other way
+async function getRunners(label, isDeleteFlow) {
+  const octokit = github.getOctokit(config.input.githubToken);
+  const targetLabels = normalizeLabels(label, isDeleteFlow);
+
+  if (targetLabels.length === 0) {
+    return null;
+  }
+
+  const labelsLeftToFind = new Set(targetLabels);
+  const foundRunnersById = new Map();
+  const perPage = 100;
+  let page = 1;
+
+  try {
+    while (true) {
+      const response = await octokit.request(
+        'GET /repos/{owner}/{repo}/actions/runners',
+        _.merge({}, config.githubContext, { per_page: perPage, page })
+      );
+
+      const runners = response.data.runners || [];
+      const totalCount = response.data.total_count || 0;
+
+      for (const runner of runners) {
+        for (const runnerLabel of runner.labels) {
+          if (labelsLeftToFind.has(runnerLabel.name)) {
+            foundRunnersById.set(runner.id, runner);
+            labelsLeftToFind.delete(runnerLabel.name);
+          }
+        }
+      }
+
+      const isLastPage = (page * perPage) >= totalCount || runners.length === 0;
+      if (isLastPage || labelsLeftToFind.size === 0) {
+        break;
+      }
+
+      page += 1;
+    }
+
+    const foundRunners = Array.from(foundRunnersById.values());
+    core.info(`Searched labels ${JSON.stringify(targetLabels)}. Found ${foundRunners.length} matching runner(s).`);
+    return foundRunners.length > 0 ? foundRunners : null;
+  } catch (error) {
+    const rateLimitHint = getRateLimitHint(error);
+    if (rateLimitHint) {
+      core.error(rateLimitHint);
+    }
+    core.error(`GitHub self-hosted runner receiving error: ${error.message}`);
+    return null;
+  }
 }
 
 
@@ -88978,11 +89027,11 @@ async function getRegistrationToken() {
 }
 
 async function removeRunner() {
-  const runners = await getRunners(config.input.label,true);
+  const runners = await getRunners(config.input.label, true);
   const octokit = github.getOctokit(config.input.githubToken);
   core.info(`got runners like this in background ${JSON.stringify(runners)} and levels from config ${JSON.stringify(config.input.label)}`);
   // skip the runner removal process if the runner is not found
-  if (runners===undefined) {
+  if (!runners || runners.length === 0) {
     core.info(`GitHub self-hosted runner with label ${config.input.label} is not found, so the removal is skipped`);
     return;
   }
@@ -89000,45 +89049,66 @@ async function removeRunner() {
   if (errors.length > 0) {
     core.setFailed('Failures occurred when removing runners.');
   }
-
 }
-async function waitForRunnerRegistered(label, timeoutMinutes, retryIntervalSeconds) {
+
+function getOfflineLabels(labels, runners) {
+  const expectedLabels = new Set(labels);
+  const onlineLabels = new Set();
+
+  for (const runner of (runners || [])) {
+    if (runner.status !== 'online') {
+      continue;
+    }
+    for (const runnerLabel of runner.labels) {
+      if (expectedLabels.has(runnerLabel.name)) {
+        onlineLabels.add(runnerLabel.name);
+      }
+    }
+  }
+
+  return labels.filter((label) => !onlineLabels.has(label));
+}
+
+async function waitForLabelsRegistered(labels, timeoutMinutes, retryIntervalSeconds, quietPeriodSeconds) {
+  const expectedLabels = normalizeLabels(labels, false);
   let waitSeconds = 0;
-  return new Promise((resolve, reject) => {
-    const interval = setInterval(async () => {
-      const runners = await getRunners(label,false);
-      core.info(`[DEBUG_ROHAN] RUNNER CONFIG ${JSON.stringify(runners)}`);
-      if (waitSeconds > timeoutMinutes * 60) {
-        core.error(`GitHub self-hosted runner registration error for label ${label}`);
-        clearInterval(interval);
-        reject(`A timeout of ${timeoutMinutes} minutes is exceeded. Your AWS EC2 instance with label ${label} was not able to register itself in GitHub as a new self-hosted runner.`);
-      }
 
-      if (runners && runners.every((runner => runner.status === 'online'))) {
-        core.info(`GitHub self-hosted runners for label ${label} are registered and ready to use`);
-        clearInterval(interval);
-        resolve();
-      } else {
-        waitSeconds += retryIntervalSeconds;
-        core.info(`Checking for label ${label}...`);
-      }
-    }, retryIntervalSeconds * 1000);
-  });
-}
-async function waitForRunnersRegistered(labels) {
-  const timeoutMinutes = 5;
-  const retryIntervalSeconds = 10;
-  const quietPeriodSeconds = 30;
+  if (quietPeriodSeconds > 0) {
+    core.info(`Waiting ${quietPeriodSeconds}s for the AWS EC2 instances to be registered in GitHub as new self-hosted runners`);
+    await sleep(quietPeriodSeconds);
+  }
 
-
-  core.info(`Waiting ${quietPeriodSeconds}s for the AWS EC2 instances to be registered in GitHub as new self-hosted runners`);
-  await new Promise(r => setTimeout(r, quietPeriodSeconds * 1000));
   core.info(`Checking every ${retryIntervalSeconds}s if the GitHub self-hosted runners are registered`);
 
-  const promises = await Promise.all(
-    labels.map(label => waitForRunnerRegistered(label, timeoutMinutes, retryIntervalSeconds))
+  while (waitSeconds <= timeoutMinutes * 60) {
+    const runners = await getRunners(expectedLabels, false);
+    const offlineLabels = getOfflineLabels(expectedLabels, runners);
+
+    if (offlineLabels.length === 0) {
+      core.info(`GitHub self-hosted runners for labels ${JSON.stringify(expectedLabels)} are registered and ready to use`);
+      return;
+    }
+
+    core.info(`Checking labels ${JSON.stringify(offlineLabels)}...`);
+    waitSeconds += retryIntervalSeconds;
+    await sleep(retryIntervalSeconds);
+  }
+
+  throw new Error(
+    `A timeout of ${timeoutMinutes} minutes is exceeded. Your AWS EC2 instances with labels ${JSON.stringify(expectedLabels)} were not able to register as new GitHub self-hosted runners.`
   );
-  return promises;
+}
+
+async function waitForRunnerRegistered(label, timeoutMinutes, retryIntervalSeconds) {
+  return waitForLabelsRegistered([label], timeoutMinutes, retryIntervalSeconds, 0);
+}
+
+async function waitForRunnersRegistered(labels) {
+  const timeoutMinutes = 5;
+  const retryIntervalSeconds = 30;
+  const quietPeriodSeconds = 30;
+
+  return waitForLabelsRegistered(labels, timeoutMinutes, retryIntervalSeconds, quietPeriodSeconds);
 }
 
 
