@@ -3,6 +3,12 @@ const github = require('@actions/github');
 const _ = require('lodash');
 const config = require('./config');
 
+const runnersCache = {
+  etag: null,
+  runners: [],
+  totalCount: 0,
+};
+
 function sleep(seconds) {
   return new Promise((resolve) => setTimeout(resolve, seconds * 1000));
 }
@@ -40,6 +46,48 @@ function getRateLimitHint(error) {
   return `GitHub API rate limit exceeded. Resets at ${resetAt}.`;
 }
 
+async function fetchAllRunners(octokit) {
+  const allRunners = [];
+  const perPage = 100;
+  let page = 1;
+  let totalCount = 0;
+
+  while (true) {
+    const requestOptions = _.merge({}, config.githubContext, { per_page: perPage, page });
+
+    if (page === 1 && runnersCache.etag) {
+      requestOptions.headers = { 'If-None-Match': runnersCache.etag };
+    }
+
+    const response = await octokit.request('GET /repos/{owner}/{repo}/actions/runners', requestOptions);
+
+    if (response.status === 304) {
+      core.info('Runners data unchanged (ETag match) - using cached data, no rate limit consumed');
+      return { runners: runnersCache.runners, totalCount: runnersCache.totalCount, fromCache: true };
+    }
+
+    if (page === 1 && response.headers.etag) {
+      runnersCache.etag = response.headers.etag;
+    }
+
+    const runners = response.data.runners || [];
+    totalCount = response.data.total_count || 0;
+    allRunners.push(...runners);
+
+    const isLastPage = (page * perPage) >= totalCount || runners.length === 0;
+    if (isLastPage) {
+      break;
+    }
+
+    page += 1;
+  }
+
+  runnersCache.runners = allRunners;
+  runnersCache.totalCount = totalCount;
+
+  return { runners: allRunners, totalCount, fromCache: false };
+}
+
 // use the unique label to find the runner
 // as we don't have the runner's id, it's not possible to get it in any other way
 async function getRunners(label, isDeleteFlow) {
@@ -50,40 +98,24 @@ async function getRunners(label, isDeleteFlow) {
     return null;
   }
 
-  const labelsLeftToFind = new Set(targetLabels);
-  const foundRunnersById = new Map();
-  const perPage = 100;
-  let page = 1;
-
   try {
-    while (true) {
-      const response = await octokit.request(
-        'GET /repos/{owner}/{repo}/actions/runners',
-        _.merge({}, config.githubContext, { per_page: perPage, page })
-      );
+    const { runners, fromCache } = await fetchAllRunners(octokit);
 
-      const runners = response.data.runners || [];
-      const totalCount = response.data.total_count || 0;
+    const labelsLeftToFind = new Set(targetLabels);
+    const foundRunnersById = new Map();
 
-      for (const runner of runners) {
-        for (const runnerLabel of runner.labels) {
-          if (labelsLeftToFind.has(runnerLabel.name)) {
-            foundRunnersById.set(runner.id, runner);
-            labelsLeftToFind.delete(runnerLabel.name);
-          }
+    for (const runner of runners) {
+      for (const runnerLabel of runner.labels) {
+        if (labelsLeftToFind.has(runnerLabel.name)) {
+          foundRunnersById.set(runner.id, runner);
+          labelsLeftToFind.delete(runnerLabel.name);
         }
       }
-
-      const isLastPage = (page * perPage) >= totalCount || runners.length === 0;
-      if (isLastPage || labelsLeftToFind.size === 0) {
-        break;
-      }
-
-      page += 1;
     }
 
     const foundRunners = Array.from(foundRunnersById.values());
-    core.info(`Searched labels ${JSON.stringify(targetLabels)}. Found ${foundRunners.length} matching runner(s).`);
+    const cacheStatus = fromCache ? ' (from cache)' : '';
+    core.info(`Searched labels ${JSON.stringify(targetLabels)}. Found ${foundRunners.length} matching runner(s)${cacheStatus}.`);
     return foundRunners.length > 0 ? foundRunners : null;
   } catch (error) {
     const rateLimitHint = getRateLimitHint(error);
@@ -155,16 +187,18 @@ function getOfflineLabels(labels, runners) {
   return labels.filter((label) => !onlineLabels.has(label));
 }
 
-async function waitForLabelsRegistered(labels, timeoutMinutes, retryIntervalSeconds, quietPeriodSeconds) {
+async function waitForLabelsRegistered(labels, timeoutMinutes, initialRetryIntervalSeconds, quietPeriodSeconds) {
   const expectedLabels = normalizeLabels(labels, false);
   let waitSeconds = 0;
+  let retryIntervalSeconds = initialRetryIntervalSeconds;
+  const maxRetryIntervalSeconds = 120;
 
   if (quietPeriodSeconds > 0) {
     core.info(`Waiting ${quietPeriodSeconds}s for the AWS EC2 instances to be registered in GitHub as new self-hosted runners`);
     await sleep(quietPeriodSeconds);
   }
 
-  core.info(`Checking every ${retryIntervalSeconds}s if the GitHub self-hosted runners are registered`);
+  core.info(`Checking with exponential backoff (starting at ${retryIntervalSeconds}s, max ${maxRetryIntervalSeconds}s) if the GitHub self-hosted runners are registered`);
 
   while (waitSeconds <= timeoutMinutes * 60) {
     const runners = await getRunners(expectedLabels, false);
@@ -175,9 +209,10 @@ async function waitForLabelsRegistered(labels, timeoutMinutes, retryIntervalSeco
       return;
     }
 
-    core.info(`Checking labels ${JSON.stringify(offlineLabels)}...`);
-    waitSeconds += retryIntervalSeconds;
+    core.info(`Waiting ${retryIntervalSeconds}s before next check. Labels still pending: ${JSON.stringify(offlineLabels)}`);
     await sleep(retryIntervalSeconds);
+    waitSeconds += retryIntervalSeconds;
+    retryIntervalSeconds = Math.min(Math.floor(retryIntervalSeconds * 1.5), maxRetryIntervalSeconds);
   }
 
   throw new Error(
@@ -190,11 +225,11 @@ async function waitForRunnerRegistered(label, timeoutMinutes, retryIntervalSecon
 }
 
 async function waitForRunnersRegistered(labels) {
-  const timeoutMinutes = 5;
-  const retryIntervalSeconds = 30;
-  const quietPeriodSeconds = 30;
+  const timeoutMinutes = 7;
+  const initialRetryIntervalSeconds = 45;
+  const quietPeriodSeconds = 60;
 
-  return waitForLabelsRegistered(labels, timeoutMinutes, retryIntervalSeconds, quietPeriodSeconds);
+  return waitForLabelsRegistered(labels, timeoutMinutes, initialRetryIntervalSeconds, quietPeriodSeconds);
 }
 
 module.exports = {
