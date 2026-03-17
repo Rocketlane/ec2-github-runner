@@ -67,7 +67,7 @@ function getRateLimitHint(error) {
   return `GitHub API rate limit exceeded. Resets at ${resetAt}.`;
 }
 
-async function fetchAllRunners(octokit) {
+async function fetchAllRunners(octokit, useCache = true) {
   const allRunners = [];
   const perPage = 100;
   let page = 1;
@@ -76,11 +76,23 @@ async function fetchAllRunners(octokit) {
   while (true) {
     const requestOptions = _.merge({}, config.githubContext, { per_page: perPage, page });
 
-    if (page === 1 && runnersCache.etag) {
+    if (useCache && page === 1 && runnersCache.etag) {
       requestOptions.headers = { 'If-None-Match': runnersCache.etag };
     }
 
-    const response = await octokit.request('GET /repos/{owner}/{repo}/actions/runners', requestOptions);
+    let response;
+    try {
+      response = await octokit.request('GET /repos/{owner}/{repo}/actions/runners', requestOptions);
+    } catch (error) {
+      // Octokit throws on 304 Not Modified instead of returning a response
+      if (error.status === 304 && useCache && runnersCache.runners.length > 0) {
+        apiStats.totalCalls++;
+        apiStats.listRunnersCalls++;
+        apiStats.cacheHits++;
+        return { runners: runnersCache.runners, totalCount: runnersCache.totalCount, fromCache: true };
+      }
+      throw error;
+    }
     apiStats.totalCalls++;
     apiStats.listRunnersCalls++;
 
@@ -113,7 +125,7 @@ async function fetchAllRunners(octokit) {
 
 // use the unique label to find the runner
 // as we don't have the runner's id, it's not possible to get it in any other way
-async function getRunners(label, isDeleteFlow) {
+async function getRunners(label, isDeleteFlow, useCache = true) {
   const octokit = github.getOctokit(config.input.githubToken);
   const targetLabels = normalizeLabels(label, isDeleteFlow);
 
@@ -122,7 +134,7 @@ async function getRunners(label, isDeleteFlow) {
   }
 
   try {
-    const { runners, fromCache } = await fetchAllRunners(octokit);
+    const { runners, fromCache } = await fetchAllRunners(octokit, useCache);
 
     const labelsLeftToFind = new Set(targetLabels);
     const foundRunnersById = new Map();
@@ -230,7 +242,7 @@ async function waitForLabelsRegistered(labels, timeoutMinutes, initialRetryInter
   core.info(`Checking with exponential backoff (starting at ${retryIntervalSeconds}s, max ${maxRetryIntervalSeconds}s) if the GitHub self-hosted runners are registered`);
 
   while (waitSeconds <= timeoutMinutes * 60) {
-    const runners = await getRunners(expectedLabels, false);
+    const runners = await getRunners(expectedLabels, false, false);
     const offlineLabels = getOfflineLabels(expectedLabels, runners);
 
     if (offlineLabels.length === 0) {
